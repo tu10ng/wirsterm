@@ -1084,6 +1084,12 @@ impl Terminal {
                 //NOOP, Handled in render
             }
             AlacTermEvent::Wakeup => {
+                if let TerminalType::Connected { connection } = &self.terminal_type {
+                    if let Some(data) = connection.read() {
+                        self.process_ssh_input(&data);
+                    }
+                }
+
                 cx.emit(Event::Wakeup);
 
                 self.emit_title_changed_if_process_changed(cx);
@@ -1421,6 +1427,14 @@ impl Terminal {
             processor.advance(&mut *term, &converted);
         }
         cx.emit(Event::Wakeup);
+    }
+
+    fn process_ssh_input(&self, bytes: &[u8]) {
+        let mut processor = alacritty_terminal::vte::ansi::Processor::<
+            alacritty_terminal::vte::ansi::StdSyncHandler,
+        >::new();
+        let mut term = self.term.lock();
+        processor.advance(&mut *term, bytes);
     }
 
     pub fn total_lines(&self) -> usize {

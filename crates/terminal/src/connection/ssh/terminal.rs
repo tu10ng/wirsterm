@@ -30,6 +30,7 @@ pub struct SshTerminalConnection {
     channel_task: Mutex<Option<Task<()>>>,
     #[allow(dead_code)]
     initial_size: WindowSize,
+    incoming_buffer: Arc<Mutex<Vec<u8>>>,
 }
 
 impl SshTerminalConnection {
@@ -50,12 +51,15 @@ impl SshTerminalConnection {
 
         *state.write() = ConnectionState::Connected;
 
+        let incoming_buffer = Arc::new(Mutex::new(Vec::new()));
+
         let channel_task = spawn_channel_task(
             channel,
             command_rx,
             event_tx,
             state.clone(),
             config.initial_command.clone(),
+            incoming_buffer.clone(),
             executor,
         );
 
@@ -65,6 +69,7 @@ impl SshTerminalConnection {
             state,
             channel_task: Mutex::new(Some(channel_task)),
             initial_size,
+            incoming_buffer,
         })
     }
 
@@ -99,6 +104,15 @@ impl TerminalConnection for SshTerminalConnection {
     fn process_info(&self) -> Option<Arc<dyn ProcessInfoProvider>> {
         None
     }
+
+    fn read(&self) -> Option<Vec<u8>> {
+        let mut buffer = self.incoming_buffer.lock();
+        if buffer.is_empty() {
+            None
+        } else {
+            Some(std::mem::take(&mut *buffer))
+        }
+    }
 }
 
 impl Drop for SshTerminalConnection {
@@ -113,6 +127,7 @@ fn spawn_channel_task(
     event_tx: UnboundedSender<AlacTermEvent>,
     state: Arc<RwLock<ConnectionState>>,
     initial_command: Option<String>,
+    incoming_buffer: Arc<Mutex<Vec<u8>>>,
     executor: BackgroundExecutor,
 ) -> Task<()> {
     executor.spawn(async move {
@@ -150,15 +165,12 @@ fn spawn_channel_task(
                 }
                 data = channel.channel.wait().fuse() => {
                     match data {
-                        Some(russh::ChannelMsg::Data { data: _ }) => {
-                            // TODO: The received data needs to be parsed through alacritty's
-                            // VTE parser and fed to the Term. This requires architectural
-                            // changes to pass the Term reference to the SSH connection.
-                            // For now, we just emit a Wakeup event.
+                        Some(russh::ChannelMsg::Data { data }) => {
+                            incoming_buffer.lock().extend_from_slice(&data);
                             event_tx.unbounded_send(AlacTermEvent::Wakeup).ok();
                         }
-                        Some(russh::ChannelMsg::ExtendedData { data: _, .. }) => {
-                            // Same as above - extended data (stderr) needs processing too.
+                        Some(russh::ChannelMsg::ExtendedData { data, .. }) => {
+                            incoming_buffer.lock().extend_from_slice(&data);
                             event_tx.unbounded_send(AlacTermEvent::Wakeup).ok();
                         }
                         Some(russh::ChannelMsg::Eof) => {

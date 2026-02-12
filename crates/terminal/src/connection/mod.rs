@@ -55,4 +55,11 @@ pub trait TerminalConnection: Send + Sync {
     fn process_info(&self) -> Option<Arc<dyn ProcessInfoProvider>> {
         None
     }
+
+    /// Read pending data from the connection.
+    /// Returns None if no data is available or if this connection
+    /// doesn't buffer incoming data (e.g., PTY handles this internally).
+    fn read(&self) -> Option<Vec<u8>> {
+        None
+    }
 }
