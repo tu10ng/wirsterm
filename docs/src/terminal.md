@@ -330,6 +330,28 @@ Show the terminal title in a breadcrumb toolbar:
 
 The title can be set by your shell using the escape sequence `\e]2;Title\007`.
 
+## SSH Connections
+
+Open an SSH terminal session directly in Zed's terminal panel. Click the "Connect" button in the terminal tab bar or use the command palette with `terminal: ssh connect`.
+
+### Connection String Formats
+
+Two formats are supported:
+
+| Format | Example | Description |
+| ------ | ------- | ----------- |
+| `user@host[:port]` | `root@192.168.1.100` | Standard SSH format with key-based authentication |
+| `host user password [port]` | `192.168.1.100 root mypass` | Space-separated format with password authentication |
+
+Examples:
+
+- `admin@example.com` — Connect as admin using SSH keys
+- `admin@example.com:2222` — Connect on port 2222
+- `192.168.1.1 root password123` — Connect with password authentication
+- `192.168.1.1 root password123 2222` — Password authentication on port 2222
+
+The standard `user@host` format uses automatic key-based authentication, trying keys from `~/.ssh/` (id_ed25519, id_rsa, id_ecdsa, id_dsa).
+
 ## Integration with Tasks
 
 The terminal integrates with Zed's [task system](./tasks.md). When you run a task, it executes in the terminal. Rerun the last task from a terminal with:
