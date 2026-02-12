@@ -5,6 +5,7 @@ use crate::{
     persistence::{
         SerializedItems, SerializedTerminalPanel, deserialize_terminal_panel, serialize_pane_group,
     },
+    ssh_connect_modal::SshConnectModal,
 };
 use breadcrumbs::Breadcrumbs;
 use collections::HashMap;
@@ -48,7 +49,9 @@ actions!(
         /// Toggles the terminal panel.
         Toggle,
         /// Toggles focus on the terminal panel.
-        ToggleFocus
+        ToggleFocus,
+        /// Opens SSH connection modal.
+        ConnectSsh
     ]
 );
 
@@ -68,6 +71,16 @@ pub fn init(cx: &mut App) {
                         workspace.close_panel::<TerminalPanel>(window, cx);
                     }
                 }
+            });
+            workspace.register_action(|workspace, _: &ConnectSsh, window, cx| {
+                let Some(terminal_panel) = workspace.panel::<TerminalPanel>(cx) else {
+                    return;
+                };
+                let pane = terminal_panel.read(cx).active_pane.clone();
+                let weak_workspace = workspace.weak_handle();
+                workspace.toggle_modal(window, cx, |window, cx| {
+                    SshConnectModal::new(weak_workspace, pane, window, cx)
+                });
             });
         },
     )
@@ -133,7 +146,7 @@ impl TerminalPanel {
         }
     }
 
-    fn apply_tab_bar_buttons(&self, terminal_pane: &Entity<Pane>, cx: &mut Context<Self>) {
+    pub(crate) fn apply_tab_bar_buttons(&self, terminal_pane: &Entity<Pane>, cx: &mut Context<Self>) {
         let assistant_tab_bar_button = self.assistant_tab_bar_button.clone();
         terminal_pane.update(cx, |pane, cx| {
             pane.set_render_tab_bar_buttons(cx, move |pane, window, cx| {
@@ -180,6 +193,14 @@ impl TerminalPanel {
                                 });
 
                                 Some(menu)
+                            }),
+                    )
+                    .child(
+                        IconButton::new("ssh-connect", IconName::Server)
+                            .icon_size(IconSize::Small)
+                            .tooltip(Tooltip::text("Connect SSH…"))
+                            .on_click(|_, window, cx| {
+                                window.dispatch_action(ConnectSsh.boxed_clone(), cx);
                             }),
                     )
                     .children(assistant_tab_bar_button.clone())
@@ -421,6 +442,7 @@ impl TerminalPanel {
                         };
                         let new_pane =
                             new_terminal_pane(self.workspace.clone(), project, false, window, cx);
+                        self.apply_tab_bar_buttons(&new_pane, cx);
                         new_pane.update(cx, |pane, cx| {
                             pane.add_item(item, true, true, None, window, cx);
                         });
