@@ -42,6 +42,10 @@ url.workspace = true
 util.workspace = true
 urlencoding.workspace = true
 parking_lot.workspace = true
+russh.workspace = true
+ssh-key.workspace = true
+async-trait.workspace = true
+dirs.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows.workspace = true

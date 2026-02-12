@@ -1,3 +1,4 @@
+pub mod connection;
 pub mod mappings;
 
 pub use alacritty_terminal;
@@ -8,8 +9,8 @@ pub mod terminal_settings;
 
 use alacritty_terminal::{
     Term,
-    event::{Event as AlacTermEvent, EventListener, Notify, WindowSize},
-    event_loop::{EventLoop, Msg, Notifier},
+    event::{Event as AlacTermEvent, EventListener, WindowSize},
+    event_loop::{EventLoop, Notifier},
     grid::{Dimensions, Grid, Row, Scroll as AlacScroll},
     index::{Boundary, Column, Direction as AlacDirection, Line, Point as AlacPoint},
     selection::{Selection, SelectionRange, SelectionType},
@@ -378,6 +379,7 @@ impl TerminalBuilder {
         let terminal = Terminal {
             task: None,
             terminal_type: TerminalType::DisplayOnly,
+            pty_info: None,
             completion_tx: None,
             term,
             term_config: config,
@@ -600,12 +602,17 @@ impl TerminalBuilder {
             let _io_thread = event_loop.spawn(); // DANGER
 
             let no_task = task.is_none();
+            let pty_info = Arc::new(pty_info);
+            let pty_connection = connection::PtyConnection::new(
+                Notifier(pty_tx),
+                pty_info.clone(),
+            );
             let terminal = Terminal {
                 task,
-                terminal_type: TerminalType::Pty {
-                    pty_tx: Notifier(pty_tx),
-                    info: Arc::new(pty_info),
+                terminal_type: TerminalType::Connected {
+                    connection: Box::new(pty_connection),
                 },
+                pty_info: Some(pty_info),
                 completion_tx,
                 term,
                 term_config: config,
@@ -680,6 +687,110 @@ impl TerminalBuilder {
         } else {
             cx.background_spawn(fut)
         }
+    }
+
+    /// Create a new terminal connected via SSH.
+    pub fn new_with_ssh(
+        ssh_config: connection::ssh::SshConfig,
+        cursor_shape: CursorShape,
+        alternate_scroll: AlternateScroll,
+        max_scroll_history_lines: Option<usize>,
+        window_id: u64,
+        cx: &App,
+        path_style: PathStyle,
+    ) -> Task<Result<TerminalBuilder>> {
+        let background_executor = cx.background_executor().clone();
+        cx.spawn(async move |_| {
+            let default_cursor_style = AlacCursorStyle::from(cursor_shape);
+            let scrolling_history = max_scroll_history_lines
+                .unwrap_or(DEFAULT_SCROLL_HISTORY_LINES)
+                .min(MAX_SCROLL_HISTORY_LINES);
+            let config = Config {
+                scrolling_history,
+                default_cursor_style,
+                ..Config::default()
+            };
+
+            let (events_tx, events_rx) = unbounded();
+            let mut term = Term::new(
+                config.clone(),
+                &TerminalBounds::default(),
+                ZedListener(events_tx.clone()),
+            );
+
+            if let AlternateScroll::Off = alternate_scroll {
+                term.unset_private_mode(PrivateMode::Named(NamedPrivateMode::AlternateScroll));
+            }
+
+            let term = Arc::new(FairMutex::new(term));
+
+            let session_manager =
+                connection::ssh::SshSessionManager::new(background_executor.clone());
+            let session = session_manager
+                .get_or_create_session(&ssh_config)
+                .await
+                .context("failed to establish SSH session")?;
+
+            let initial_size = TerminalBounds::default().into();
+            let ssh_connection = connection::ssh::SshTerminalConnection::new(
+                session,
+                &ssh_config,
+                initial_size,
+                events_tx,
+                background_executor.clone(),
+            )
+            .await
+            .context("failed to create SSH terminal channel")?;
+
+            let terminal = Terminal {
+                task: None,
+                terminal_type: TerminalType::Connected {
+                    connection: Box::new(ssh_connection),
+                },
+                pty_info: None,
+                completion_tx: None,
+                term,
+                term_config: config,
+                title_override: None,
+                events: VecDeque::with_capacity(10),
+                last_content: Default::default(),
+                last_mouse: None,
+                matches: Vec::new(),
+                selection_head: None,
+                breadcrumb_text: String::new(),
+                scroll_px: px(0.),
+                next_link_id: 0,
+                selection_phase: SelectionPhase::Ended,
+                hyperlink_regex_searches: RegexSearches::default(),
+                vi_mode_enabled: false,
+                is_remote_terminal: true,
+                last_mouse_move_time: Instant::now(),
+                last_hyperlink_search_position: None,
+                mouse_down_hyperlink: None,
+                #[cfg(windows)]
+                shell_program: None,
+                activation_script: Vec::new(),
+                template: CopyTemplate {
+                    shell: Shell::System,
+                    env: HashMap::default(),
+                    cursor_shape,
+                    alternate_scroll,
+                    max_scroll_history_lines,
+                    path_hyperlink_regexes: Vec::default(),
+                    path_hyperlink_timeout_ms: 0,
+                    window_id,
+                },
+                child_exited: None,
+                event_loop_task: Task::ready(Ok(())),
+                background_executor,
+                path_style,
+            };
+
+            Ok(TerminalBuilder {
+                terminal,
+                events_rx,
+            })
+        })
     }
 
     pub fn subscribe(mut self, cx: &Context<Terminal>) -> Terminal {
@@ -831,15 +942,15 @@ pub enum SelectionPhase {
 }
 
 enum TerminalType {
-    Pty {
-        pty_tx: Notifier,
-        info: Arc<PtyProcessInfo>,
+    Connected {
+        connection: Box<dyn connection::TerminalConnection>,
     },
     DisplayOnly,
 }
 
 pub struct Terminal {
     terminal_type: TerminalType,
+    pty_info: Option<Arc<PtyProcessInfo>>,
     completion_tx: Option<Sender<Option<ExitStatus>>>,
     term: Arc<FairMutex<Term<ZedListener>>>,
     term_config: Config,
@@ -975,9 +1086,7 @@ impl Terminal {
             AlacTermEvent::Wakeup => {
                 cx.emit(Event::Wakeup);
 
-                if let TerminalType::Pty { info, .. } = &self.terminal_type {
-                    info.emit_title_changed_if_changed(cx);
-                }
+                self.emit_title_changed_if_process_changed(cx);
             }
             AlacTermEvent::ColorRequest(index, format) => {
                 // It's important that the color request is processed here to retain relative order
@@ -1018,8 +1127,8 @@ impl Terminal {
 
                 self.last_content.terminal_bounds = new_bounds;
 
-                if let TerminalType::Pty { pty_tx, .. } = &self.terminal_type {
-                    pty_tx.0.send(Msg::Resize(new_bounds.into())).ok();
+                if let TerminalType::Connected { connection } = &self.terminal_type {
+                    connection.resize(new_bounds.into()).ok();
                 }
 
                 term.resize(new_bounds);
@@ -1430,19 +1539,25 @@ impl Terminal {
         }
     }
 
-    /// Write the Input payload to the PTY, if applicable.
+    /// Write the Input payload to the connection, if applicable.
     /// (This is a no-op for display-only terminals.)
     fn write_to_pty(&self, input: impl Into<Cow<'static, [u8]>>) {
-        if let TerminalType::Pty { pty_tx, .. } = &self.terminal_type {
+        if let TerminalType::Connected { connection } = &self.terminal_type {
             let input = input.into();
             if log::log_enabled!(log::Level::Debug) {
                 if let Ok(str) = str::from_utf8(&input) {
-                    log::debug!("Writing to PTY: {:?}", str);
+                    log::debug!("Writing to connection: {:?}", str);
                 } else {
-                    log::debug!("Writing to PTY: {:?}", input);
+                    log::debug!("Writing to connection: {:?}", input);
                 }
             }
-            pty_tx.notify(input);
+            connection.write(input).ok();
+        }
+    }
+
+    fn emit_title_changed_if_process_changed(&self, cx: &mut Context<Self>) {
+        if let Some(info) = &self.pty_info {
+            info.emit_title_changed_if_changed(cx);
         }
     }
 
@@ -2098,14 +2213,9 @@ impl Terminal {
     /// This does *not* return the working directory of the shell that runs on the
     /// remote host, in case Zed is connected to a remote host.
     fn client_side_working_directory(&self) -> Option<PathBuf> {
-        match &self.terminal_type {
-            TerminalType::Pty { info, .. } => info
-                .current
-                .read()
-                .as_ref()
-                .map(|process| process.cwd.clone()),
-            TerminalType::DisplayOnly => None,
-        }
+        self.pty_info
+            .as_ref()
+            .and_then(|info| info.current.read().as_ref().map(|process| process.cwd.clone()))
     }
 
     pub fn title(&self, truncate: bool) -> String {
@@ -2122,40 +2232,39 @@ impl Terminal {
                 .title_override
                 .as_ref()
                 .map(|title_override| title_override.to_string())
-                .unwrap_or_else(|| match &self.terminal_type {
-                    TerminalType::Pty { info, .. } => info
-                        .current
-                        .read()
+                .unwrap_or_else(|| {
+                    self.pty_info
                         .as_ref()
-                        .map(|fpi| {
-                            let process_file = fpi
-                                .cwd
-                                .file_name()
-                                .map(|name| name.to_string_lossy().into_owned())
-                                .unwrap_or_default();
+                        .and_then(|info| {
+                            info.current.read().as_ref().map(|fpi| {
+                                let process_file = fpi
+                                    .cwd
+                                    .file_name()
+                                    .map(|name| name.to_string_lossy().into_owned())
+                                    .unwrap_or_default();
 
-                            let argv = fpi.argv.as_slice();
-                            let process_name = format!(
-                                "{}{}",
-                                fpi.name,
-                                if !argv.is_empty() {
-                                    format!(" {}", (argv[1..]).join(" "))
+                                let argv = fpi.argv.as_slice();
+                                let process_name = format!(
+                                    "{}{}",
+                                    fpi.name,
+                                    if !argv.is_empty() {
+                                        format!(" {}", (argv[1..]).join(" "))
+                                    } else {
+                                        "".to_string()
+                                    }
+                                );
+                                let (process_file, process_name) = if truncate {
+                                    (
+                                        truncate_and_trailoff(&process_file, MAX_CHARS),
+                                        truncate_and_trailoff(&process_name, MAX_CHARS),
+                                    )
                                 } else {
-                                    "".to_string()
-                                }
-                            );
-                            let (process_file, process_name) = if truncate {
-                                (
-                                    truncate_and_trailoff(&process_file, MAX_CHARS),
-                                    truncate_and_trailoff(&process_name, MAX_CHARS),
-                                )
-                            } else {
-                                (process_file, process_name)
-                            };
-                            format!("{process_file} — {process_name}")
+                                    (process_file, process_name)
+                                };
+                                format!("{process_file} — {process_name}")
+                            })
                         })
-                        .unwrap_or_else(|| "Terminal".to_string()),
-                    TerminalType::DisplayOnly => "Terminal".to_string(),
+                        .unwrap_or_else(|| "Terminal".to_string())
                 }),
         }
     }
@@ -2164,7 +2273,7 @@ impl Terminal {
         if let Some(task) = self.task()
             && task.status == TaskStatus::Running
         {
-            if let TerminalType::Pty { info, .. } = &self.terminal_type {
+            if let Some(info) = &self.pty_info {
                 // First kill the foreground process group (the command running in the shell)
                 info.kill_current_process();
                 // Then kill the shell itself so that the terminal exits properly
@@ -2175,17 +2284,11 @@ impl Terminal {
     }
 
     pub fn pid(&self) -> Option<sysinfo::Pid> {
-        match &self.terminal_type {
-            TerminalType::Pty { info, .. } => info.pid(),
-            TerminalType::DisplayOnly => None,
-        }
+        self.pty_info.as_ref().and_then(|info| info.pid())
     }
 
     pub fn pid_getter(&self) -> Option<&ProcessIdGetter> {
-        match &self.terminal_type {
-            TerminalType::Pty { info, .. } => Some(info.pid_getter()),
-            TerminalType::DisplayOnly => None,
-        }
+        self.pty_info.as_ref().map(|info| info.pid_getter())
     }
 
     pub fn task(&self) -> Option<&TaskState> {
@@ -2386,18 +2489,20 @@ unsafe fn append_text_to_term(term: &mut Term<ZedListener>, text_lines: &[&str])
 
 impl Drop for Terminal {
     fn drop(&mut self) {
-        if let TerminalType::Pty { pty_tx, info } =
+        if let TerminalType::Connected { connection } =
             std::mem::replace(&mut self.terminal_type, TerminalType::DisplayOnly)
         {
-            pty_tx.0.send(Msg::Shutdown).ok();
+            connection.shutdown().ok();
 
-            let timer = self.background_executor.timer(Duration::from_millis(100));
-            self.background_executor
-                .spawn(async move {
-                    timer.await;
-                    info.kill_child_process();
-                })
-                .detach();
+            if let Some(info) = self.pty_info.take() {
+                let timer = self.background_executor.timer(Duration::from_millis(100));
+                self.background_executor
+                    .spawn(async move {
+                        timer.await;
+                        info.kill_child_process();
+                    })
+                    .detach();
+            }
         }
     }
 }

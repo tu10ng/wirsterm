@@ -1,4 +1,61 @@
-# Rust coding guidelines
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## Build and Development Commands
+
+**Build and run (debug):**
+```sh
+cargo run
+```
+
+**Build and run (release CLI):**
+```sh
+cargo run -p cli
+```
+
+**Run tests:**
+```sh
+cargo test --workspace
+```
+
+**Run a single test:**
+```sh
+cargo test -p <crate_name> <test_name>
+```
+
+**Lint (use this instead of `cargo clippy`):**
+```sh
+./script/clippy
+```
+
+**Install dependencies (Linux):**
+```sh
+script/linux
+```
+
+**Install local development build:**
+```sh
+./script/install-linux
+```
+
+## High-Level Architecture
+
+This is a fork of [Zed](https://github.com/zed-industries/zed), a GPU-accelerated code editor. Key crates:
+
+- **gpui** (`crates/gpui`): GPU-accelerated UI framework providing state management, concurrency primitives, and rendering. The core abstraction layer.
+- **zed** (`crates/zed`): Main application entry point that ties everything together.
+- **editor** (`crates/editor`): Core text editor component used for both code editing and input fields. Handles LSP display features.
+- **workspace** (`crates/workspace`): Window management, local state serialization, and project grouping.
+- **project** (`crates/project`): File management, navigation, and LSP communication.
+- **language** (`crates/language`): Language understanding including syntax trees and symbol lists.
+- **lsp** (`crates/lsp`): LSP server communication.
+- **vim** (`crates/vim`): Vim mode implementation over the editor.
+- **ui** (`crates/ui`): Shared UI components and patterns.
+- **collab** (`crates/collab`): Collaboration server for project sharing.
+- **terminal** / **terminal_view** (`crates/terminal`, `crates/terminal_view`): Terminal emulator.
+
+## Rust Coding Guidelines
 
 * Prioritize code correctness and clarity. Speed and efficiency are secondary priorities unless otherwise specified.
 * Do not write organizational or comments that summarize the code. Comments should only be written in order to explain "why" the code is written in some way in the case there is a reason that is tricky / non-obvious.
