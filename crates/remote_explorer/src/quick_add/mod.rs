@@ -13,6 +13,11 @@ use terminal::SessionStoreEntity;
 use ui::{prelude::*, Color, Disclosure, Label, LabelSize, h_flex, v_flex};
 use workspace::{Pane, Workspace};
 
+pub enum ConnectionResult {
+    Ssh(terminal::SshSessionConfig, Entity<Workspace>, Entity<Pane>),
+    Telnet(terminal::TelnetSessionConfig, Entity<Workspace>, Entity<Pane>),
+}
+
 pub struct QuickAddArea {
     expanded: bool,
     pub auto_recognize: AutoRecognizeSection,
@@ -114,7 +119,7 @@ impl QuickAddArea {
         pane: Option<Entity<Pane>>,
         window: &mut Window,
         cx: &mut App,
-    ) -> Option<(terminal::SshSessionConfig, Entity<Workspace>, Entity<Pane>)> {
+    ) -> Option<ConnectionResult> {
         let input = self.auto_recognize.get_input(cx);
         let parsed = parse_connection_text(&input);
 
@@ -124,7 +129,7 @@ impl QuickAddArea {
 
         let result = if parsed.len() == 1 {
             let connection = &parsed[0];
-            self.connect_single(connection.clone(), workspace, pane, window, cx)
+            self.connect_single(connection.clone(), workspace, pane, cx)
         } else {
             self.show_multi_connection_modal(parsed, workspace, pane, window, cx);
             None
@@ -139,9 +144,8 @@ impl QuickAddArea {
         connection: ParsedConnection,
         workspace: WeakEntity<Workspace>,
         pane: Option<Entity<Pane>>,
-        _window: &mut Window,
         cx: &mut App,
-    ) -> Option<(terminal::SshSessionConfig, Entity<Workspace>, Entity<Pane>)> {
+    ) -> Option<ConnectionResult> {
         match connection.protocol {
             ConnectionProtocol::Telnet => {
                 let config = terminal::TelnetSessionConfig::new(&connection.host, connection.port);
@@ -155,14 +159,17 @@ impl QuickAddArea {
 
                 let session_name = format!("{}:{}", connection.host, connection.port);
                 let session_config =
-                    terminal::SessionConfig::new_telnet(session_name.clone(), config);
+                    terminal::SessionConfig::new_telnet(session_name, config.clone());
 
                 self.session_store.update(cx, |store, cx| {
                     store.add_session(session_config, None, cx);
                 });
 
-                log::info!("Telnet connection not yet implemented: {}", session_name);
-                None
+                if let (Some(workspace), Some(pane)) = (workspace.upgrade(), pane) {
+                    Some(ConnectionResult::Telnet(config, workspace, pane))
+                } else {
+                    None
+                }
             }
             ConnectionProtocol::Ssh => {
                 let username = connection.username.unwrap_or_else(|| "root".to_string());
@@ -181,7 +188,7 @@ impl QuickAddArea {
                 });
 
                 if let (Some(workspace), Some(pane)) = (workspace.upgrade(), pane) {
-                    Some((ssh_config, workspace, pane))
+                    Some(ConnectionResult::Ssh(ssh_config, workspace, pane))
                 } else {
                     None
                 }
@@ -211,15 +218,15 @@ impl QuickAddArea {
 
     pub fn handle_telnet_connect(
         &mut self,
-        _workspace: WeakEntity<Workspace>,
-        _pane: Option<Entity<Pane>>,
+        workspace: WeakEntity<Workspace>,
+        pane: Option<Entity<Pane>>,
         window: &mut Window,
         cx: &mut App,
-    ) {
+    ) -> Option<(terminal::TelnetSessionConfig, Entity<Workspace>, Entity<Pane>)> {
         let (host, port, username, password) = self.telnet_section.get_values(cx);
 
         if host.is_empty() {
-            return;
+            return None;
         }
 
         let port = port.parse::<u16>().unwrap_or(23);
@@ -236,14 +243,18 @@ impl QuickAddArea {
             format!("{}@{}:{}", username, host, port)
         };
 
-        let session_config = terminal::SessionConfig::new_telnet(session_name.clone(), config);
+        let session_config = terminal::SessionConfig::new_telnet(session_name, config.clone());
         self.session_store.update(cx, |store, cx| {
             store.add_session(session_config, None, cx);
         });
 
-        log::info!("Telnet connection not yet implemented: {}", session_name);
-
         self.telnet_section.clear_fields(window, cx);
+
+        if let (Some(workspace), Some(pane)) = (workspace.upgrade(), pane) {
+            Some((config, workspace, pane))
+        } else {
+            None
+        }
     }
 
     pub fn handle_ssh_connect(
@@ -341,6 +352,70 @@ pub fn connect_ssh<T: 'static>(
             Ok(builder) => builder,
             Err(error) => {
                 log::error!("Failed to create SSH terminal: {}", error);
+                return;
+            }
+        };
+
+        workspace
+            .update_in(cx, |workspace, window, cx| {
+                let terminal_handle = cx.new(|cx| terminal_builder.subscribe(cx));
+                let terminal_view = Box::new(cx.new(|cx| {
+                    terminal_view::TerminalView::new(
+                        terminal_handle,
+                        weak_workspace.clone(),
+                        workspace.database_id(),
+                        workspace.project().downgrade(),
+                        window,
+                        cx,
+                    )
+                }));
+
+                pane.update(cx, |pane, cx| {
+                    pane.add_item(terminal_view, true, true, None, window, cx);
+                });
+            })
+            .ok();
+    })
+    .detach();
+}
+
+pub fn connect_telnet<T: 'static>(
+    telnet_config: terminal::TelnetSessionConfig,
+    workspace: Entity<Workspace>,
+    pane: Entity<Pane>,
+    window: &mut Window,
+    cx: &mut gpui::Context<T>,
+) {
+    use settings::Settings;
+    use terminal::connection::telnet::TelnetConfig;
+    use terminal::terminal_settings::TerminalSettings;
+    use terminal::TerminalBuilder;
+    use util::paths::PathStyle;
+
+    let config: TelnetConfig = (&telnet_config).into();
+    let settings = TerminalSettings::get_global(cx);
+    let cursor_shape = settings.cursor_shape;
+    let alternate_scroll = settings.alternate_scroll;
+    let max_scroll_history_lines = settings.max_scroll_history_lines;
+    let path_style = PathStyle::local();
+    let window_id = window.window_handle().window_id().as_u64();
+    let weak_workspace = workspace.downgrade();
+
+    let terminal_task = TerminalBuilder::new_with_telnet(
+        config,
+        cursor_shape,
+        alternate_scroll,
+        max_scroll_history_lines,
+        window_id,
+        cx,
+        path_style,
+    );
+
+    cx.spawn_in(window, async move |_, cx| {
+        let terminal_builder = match terminal_task.await {
+            Ok(builder) => builder,
+            Err(error) => {
+                log::error!("Failed to create Telnet terminal: {}", error);
                 return;
             }
         };

@@ -241,11 +241,11 @@ impl RemoteExplorer {
                 }
             }
             ProtocolConfig::Telnet(telnet_config) => {
-                log::info!(
-                    "Telnet connection not yet implemented: {}:{}",
-                    telnet_config.host,
-                    telnet_config.port
-                );
+                let workspace = self.workspace.clone();
+                let pane = self.get_terminal_pane(cx);
+                if let (Some(workspace), Some(pane)) = (workspace.upgrade(), pane) {
+                    connect_telnet(telnet_config.clone(), workspace, pane, window, cx);
+                }
             }
         }
     }
@@ -306,19 +306,30 @@ impl RemoteExplorer {
     fn handle_auto_recognize_confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let workspace = self.workspace.clone();
         let pane = self.get_terminal_pane(cx);
-        if let Some((ssh_config, workspace, pane)) = self
+        if let Some(result) = self
             .quick_add_area
             .handle_auto_recognize_confirm(workspace, pane, window, cx)
         {
-            connect_ssh(ssh_config, workspace, pane, window, cx);
+            match result {
+                ConnectionResult::Ssh(ssh_config, workspace, pane) => {
+                    connect_ssh(ssh_config, workspace, pane, window, cx);
+                }
+                ConnectionResult::Telnet(telnet_config, workspace, pane) => {
+                    connect_telnet(telnet_config, workspace, pane, window, cx);
+                }
+            }
         }
     }
 
     fn handle_telnet_connect(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let workspace = self.workspace.clone();
         let pane = self.get_terminal_pane(cx);
-        self.quick_add_area
-            .handle_telnet_connect(workspace, pane, window, cx);
+        if let Some((telnet_config, workspace, pane)) = self
+            .quick_add_area
+            .handle_telnet_connect(workspace, pane, window, cx)
+        {
+            connect_telnet(telnet_config, workspace, pane, window, cx);
+        }
     }
 
     fn handle_ssh_connect(&mut self, window: &mut Window, cx: &mut Context<Self>) {

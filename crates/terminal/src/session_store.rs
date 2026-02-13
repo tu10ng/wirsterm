@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::connection::ssh::{SshAuthConfig, SshConfig};
+use crate::connection::telnet::TelnetConfig;
 
 /// A saved credential preset for quick connection.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -261,6 +262,22 @@ impl From<&SshAuthConfig> for AuthMethod {
                 passphrase: passphrase.clone(),
             },
         }
+    }
+}
+
+impl From<&TelnetSessionConfig> for TelnetConfig {
+    fn from(config: &TelnetSessionConfig) -> Self {
+        let mut telnet_config = TelnetConfig::new(&config.host, config.port);
+        if let Some(username) = &config.username {
+            telnet_config = telnet_config.with_username(username);
+        }
+        if let Some(password) = &config.password {
+            telnet_config = telnet_config.with_password(password);
+        }
+        if let Some(encoding) = &config.encoding {
+            telnet_config = telnet_config.with_encoding(encoding);
+        }
+        telnet_config
     }
 }
 

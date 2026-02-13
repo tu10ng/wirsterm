@@ -807,6 +807,120 @@ impl TerminalBuilder {
         })
     }
 
+    /// Create a new terminal connected via Telnet.
+    pub fn new_with_telnet(
+        telnet_config: connection::telnet::TelnetConfig,
+        cursor_shape: CursorShape,
+        alternate_scroll: AlternateScroll,
+        max_scroll_history_lines: Option<usize>,
+        window_id: u64,
+        cx: &App,
+        path_style: PathStyle,
+    ) -> Task<Result<TerminalBuilder>> {
+        let background_executor = cx.background_executor().clone();
+        let tokio_handle = gpui_tokio::Tokio::handle(cx);
+        cx.spawn(async move |_| {
+            let default_cursor_style = AlacCursorStyle::from(cursor_shape);
+            let scrolling_history = max_scroll_history_lines
+                .unwrap_or(DEFAULT_SCROLL_HISTORY_LINES)
+                .min(MAX_SCROLL_HISTORY_LINES);
+            let config = Config {
+                scrolling_history,
+                default_cursor_style,
+                ..Config::default()
+            };
+
+            let (events_tx, events_rx) = unbounded();
+            let mut term = Term::new(
+                config.clone(),
+                &TerminalBounds::default(),
+                ZedListener(events_tx.clone()),
+            );
+
+            if let AlternateScroll::Off = alternate_scroll {
+                term.unset_private_mode(PrivateMode::Named(NamedPrivateMode::AlternateScroll));
+            }
+
+            let term = Arc::new(FairMutex::new(term));
+
+            let initial_size = TerminalBounds::default().into();
+            let telnet_connection = tokio_handle
+                .spawn({
+                    let tokio_handle = tokio_handle.clone();
+                    let telnet_config = telnet_config.clone();
+                    async move {
+                        let (session, read_half, write_half) =
+                            connection::telnet::TelnetSession::connect(&telnet_config)
+                                .await
+                                .context("failed to establish Telnet connection")?;
+
+                        connection::telnet::TelnetTerminalConnection::new(
+                            session,
+                            read_half,
+                            write_half,
+                            &telnet_config,
+                            initial_size,
+                            events_tx,
+                            tokio_handle,
+                        )
+                        .await
+                        .context("failed to create Telnet terminal connection")
+                    }
+                })
+                .await
+                .context("Telnet connection task panicked")??;
+
+            let terminal = Terminal {
+                task: None,
+                terminal_type: TerminalType::Connected {
+                    connection: Box::new(telnet_connection),
+                },
+                pty_info: None,
+                completion_tx: None,
+                term,
+                term_config: config,
+                title_override: None,
+                events: VecDeque::with_capacity(10),
+                last_content: Default::default(),
+                last_mouse: None,
+                matches: Vec::new(),
+                selection_head: None,
+                breadcrumb_text: String::new(),
+                scroll_px: px(0.),
+                next_link_id: 0,
+                selection_phase: SelectionPhase::Ended,
+                hyperlink_regex_searches: RegexSearches::default(),
+                vi_mode_enabled: false,
+                is_remote_terminal: true,
+                last_mouse_move_time: Instant::now(),
+                last_hyperlink_search_position: None,
+                mouse_down_hyperlink: None,
+                #[cfg(windows)]
+                shell_program: None,
+                activation_script: Vec::new(),
+                template: CopyTemplate {
+                    shell: Shell::System,
+                    env: HashMap::default(),
+                    cursor_shape,
+                    alternate_scroll,
+                    max_scroll_history_lines,
+                    path_hyperlink_regexes: Vec::default(),
+                    path_hyperlink_timeout_ms: 0,
+                    window_id,
+                },
+                child_exited: None,
+                event_loop_task: Task::ready(Ok(())),
+                background_executor,
+                path_style,
+            };
+
+            Ok(TerminalBuilder {
+                terminal,
+                events_rx,
+            })
+        })
+    }
+
     pub fn subscribe(mut self, cx: &Context<Terminal>) -> Terminal {
         //Event loop
         self.terminal.event_loop_task = cx.spawn(async move |terminal, cx| {

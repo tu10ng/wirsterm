@@ -1,5 +1,6 @@
 mod pty;
 pub mod ssh;
+pub mod telnet;
 
 use std::{borrow::Cow, path::PathBuf, sync::Arc};
 

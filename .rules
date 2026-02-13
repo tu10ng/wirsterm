@@ -271,6 +271,81 @@ cx.subscribe(&sessions, |this, _, event, cx| {
 
 Sessions are stored in `~/.config/zed/sessions.json` (or platform equivalent via `paths::sessions_file()`).
 
+## Telnet Connection
+
+The terminal crate includes a Telnet connection module (`crates/terminal/src/connection/telnet/`) for connecting to remote hosts via the Telnet protocol.
+
+### Module Structure
+
+```
+telnet/
+  mod.rs          # TelnetConfig, exports
+  protocol.rs     # Telnet IAC handling, option negotiation
+  session.rs      # TelnetSession - TCP connection management
+  terminal.rs     # TelnetTerminalConnection - implements TerminalConnection trait
+```
+
+### Protocol Implementation (`protocol.rs`)
+
+- **IAC Commands**: IAC (255), DO (253), DONT (254), WILL (251), WONT (252), SB (250), SE (240)
+- **Option Codes**: ECHO (1), SUPPRESS_GO_AHEAD (3), TERMINAL_TYPE (24), NAWS (31)
+- `TelnetNegotiator`: Parses IAC sequences and generates appropriate responses
+- `process_incoming()`: Separates terminal data from commands, returns protocol responses
+- `build_naws()`: Generates window size subnegotiation packet (RFC 1073)
+- IAC escaping: 255 255 → single 255
+
+### TelnetConfig (`mod.rs`)
+
+```rust
+pub struct TelnetConfig {
+    pub host: String,
+    pub port: u16,
+    pub username: Option<String>,
+    pub password: Option<String>,
+    pub encoding: Option<String>,
+    pub terminal_type: String,  // default: "xterm-256color"
+}
+```
+
+### TelnetSession (`session.rs`)
+
+Manages TCP connection lifecycle:
+- `connect()`: Establishes TCP connection, returns read/write halves for the channel task
+
+### TelnetTerminalConnection (`terminal.rs`)
+
+Implements `TerminalConnection` trait (same interface as SSH):
+- Uses `TelnetChannelCommand` enum (Write, Resize, Close)
+- Channel task with `futures::select_biased!` for concurrent I/O
+- Automatic NAWS window size updates after negotiation
+
+### Usage
+
+```rust
+// Create terminal with Telnet connection
+let terminal = TerminalBuilder::new_with_telnet(
+    telnet_config,
+    cursor_shape,
+    alternate_scroll,
+    max_scroll_history_lines,
+    window_id,
+    cx,
+    path_style,
+).await?;
+
+// Or connect via quick_add helper
+connect_telnet(telnet_config, workspace, pane, window, cx);
+```
+
+### Converting from SessionStore config
+
+```rust
+use terminal::connection::telnet::TelnetConfig;
+
+let telnet_session_config: TelnetSessionConfig = /* from session store */;
+let config: TelnetConfig = (&telnet_session_config).into();
+```
+
 ## Remote Explorer Panel
 
 The `remote_explorer` crate (`crates/remote_explorer`) provides a panel for browsing saved SSH/Telnet sessions in a tree view.
