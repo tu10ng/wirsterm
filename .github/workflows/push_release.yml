@@ -1,0 +1,79 @@
+name: Push Release
+
+on:
+  push:
+    branches:
+      - master
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: ./script/linux
+
+      - name: Build release
+        run: cargo build --release --package zed --package cli
+
+      - name: Package
+        run: |
+          mkdir -p release-artifacts
+          tar -czvf release-artifacts/zed-linux-x86_64.tar.gz \
+            -C target/release zed cli
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-build
+          path: release-artifacts/
+
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build release
+        shell: pwsh
+        run: cargo build --release --package zed --package cli
+
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path release-artifacts -Force
+          Compress-Archive -Path target/release/zed.exe, target/release/cli.exe `
+            -DestinationPath release-artifacts/zed-windows-x86_64.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-build
+          path: release-artifacts/
+
+  create-release:
+    needs: [build-linux, build-windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+
+      - name: Create Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="v$(date +'%Y%m%d%H%M%S')-${GITHUB_SHA::7}"
+
+          gh release create "$VERSION" \
+            --title "Release $VERSION" \
+            --notes "Automated release from commit ${GITHUB_SHA}" \
+            --latest \
+            artifacts/linux-build/* \
+            artifacts/windows-build/*
