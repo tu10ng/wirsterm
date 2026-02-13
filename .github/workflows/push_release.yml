@@ -37,6 +37,9 @@ jobs:
   build-windows:
     runs-on: windows-latest
     steps:
+      - name: Enable long paths
+        run: git config --system core.longpaths true
+
       - uses: actions/checkout@v4
 
       - name: Build release
