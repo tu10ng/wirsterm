@@ -1,17 +1,18 @@
 mod quick_add;
+mod session_edit_modal;
 
 use std::ops::Range;
 
 use anyhow::Result;
 use gpui::{
-    Action, App, AppContext as _, AsyncWindowContext, ClickEvent, Context, Entity, EventEmitter,
-    FocusHandle, Focusable, ParentElement, Render, Styled, Subscription, UniformListScrollHandle,
-    WeakEntity, Window, px, uniform_list,
+    Action, App, AppContext as _, AsyncWindowContext, ClickEvent, Context, DismissEvent, Entity,
+    EventEmitter, FocusHandle, Focusable, MouseDownEvent, ParentElement, Point, Render, Styled,
+    Subscription, UniformListScrollHandle, WeakEntity, Window, anchored, deferred, px, uniform_list,
 };
-use terminal::{SessionNode, SessionStoreEntity, SessionStoreEvent};
+use terminal::{ProtocolConfig, SessionNode, SessionStoreEntity, SessionStoreEvent};
 use ui::{
-    prelude::*, Color, Disclosure, Icon, IconName, IconSize, Label, LabelSize, ListItem,
-    ListItemSpacing, h_flex, v_flex,
+    prelude::*, Color, ContextMenu, Disclosure, Icon, IconName, IconSize, Label, LabelSize,
+    ListItem, ListItemSpacing, h_flex, v_flex,
 };
 use uuid::Uuid;
 use workspace::{
@@ -21,6 +22,7 @@ use workspace::{
 use zed_actions::remote_explorer::ToggleFocus;
 
 pub use quick_add::*;
+pub use session_edit_modal::SessionEditModal;
 
 const REMOTE_EXPLORER_PANEL_KEY: &str = "RemoteExplorerPanel";
 
@@ -52,6 +54,8 @@ pub struct RemoteExplorer {
     width: Option<Pixels>,
     quick_add_expanded: bool,
     quick_add_area: QuickAddArea,
+    selected_entry_id: Option<Uuid>,
+    context_menu: Option<(Entity<ContextMenu>, Point<Pixels>, Subscription)>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -111,6 +115,8 @@ impl RemoteExplorer {
             width: None,
             quick_add_expanded: true,
             quick_add_area,
+            selected_entry_id: None,
+            context_menu: None,
             _subscriptions: vec![
                 session_store_subscription,
                 username_subscription,
@@ -157,6 +163,86 @@ impl RemoteExplorer {
 
     fn toggle_quick_add(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         self.quick_add_expanded = !self.quick_add_expanded;
+        cx.notify();
+    }
+
+    fn select_entry(&mut self, id: Uuid, cx: &mut Context<Self>) {
+        self.selected_entry_id = Some(id);
+        cx.notify();
+    }
+
+    fn connect_session(&mut self, id: Uuid, window: &mut Window, cx: &mut Context<Self>) {
+        let session_store = self.session_store.read(cx);
+        let Some(node) = session_store.store().find_node(id) else {
+            return;
+        };
+
+        let SessionNode::Session(session) = node else {
+            return;
+        };
+
+        match &session.protocol {
+            ProtocolConfig::Ssh(ssh_config) => {
+                let workspace = self.workspace.clone();
+                let pane = self.get_terminal_pane(cx);
+                if let (Some(workspace), Some(pane)) = (workspace.upgrade(), pane) {
+                    connect_ssh(ssh_config.clone(), workspace, pane, window, cx);
+                }
+            }
+            ProtocolConfig::Telnet(telnet_config) => {
+                log::info!(
+                    "Telnet connection not yet implemented: {}:{}",
+                    telnet_config.host,
+                    telnet_config.port
+                );
+            }
+        }
+    }
+
+    fn deploy_context_menu(
+        &mut self,
+        position: Point<Pixels>,
+        entry_id: Uuid,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let session_store = self.session_store.read(cx);
+        let Some(node) = session_store.store().find_node(entry_id) else {
+            return;
+        };
+
+        let SessionNode::Session(_session) = node else {
+            return;
+        };
+
+        let workspace = self.workspace.clone();
+        let session_store_entity = self.session_store.clone();
+
+        let context_menu = ContextMenu::build(window, cx, move |menu, _window, _cx| {
+            let workspace_for_edit = workspace.clone();
+
+            menu.entry("Edit Session", None, move |window, cx| {
+                if let Some(workspace) = workspace_for_edit.upgrade() {
+                    workspace.update(cx, |ws, cx| {
+                        ws.toggle_modal(window, cx, |window, cx| {
+                            SessionEditModal::new(entry_id, window, cx)
+                        });
+                    });
+                }
+            })
+            .entry("Delete Session", None, move |_window, cx| {
+                session_store_entity.update(cx, |store, cx| {
+                    store.remove_node(entry_id, cx);
+                });
+            })
+        });
+
+        window.focus(&context_menu.focus_handle(cx), cx);
+        let subscription = cx.subscribe(&context_menu, |this, _, _: &DismissEvent, cx| {
+            this.context_menu.take();
+            cx.notify();
+        });
+        self.context_menu = Some((context_menu, position, subscription));
         cx.notify();
     }
 
@@ -478,6 +564,7 @@ impl RemoteExplorer {
         let entry = &self.visible_entries[index];
         let id = entry.id;
         let depth = entry.depth;
+        let is_selected = self.selected_entry_id == Some(id);
 
         let (icon, name, is_group, is_expanded) = match &entry.node {
             SessionNode::Group(group) => (
@@ -498,10 +585,30 @@ impl RemoteExplorer {
             .indent_step_size(px(12.))
             .spacing(ListItemSpacing::Dense)
             .toggle(is_expanded)
+            .toggle_state(is_selected)
             .when(is_group, |this| {
                 this.on_toggle(cx.listener(move |this, _, window, cx| {
                     this.toggle_expanded(id, window, cx);
                 }))
+                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                    this.toggle_expanded(id, window, cx);
+                }))
+            })
+            .when(!is_group, |this| {
+                this.on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                    if event.click_count() == 2 {
+                        this.connect_session(id, window, cx);
+                    } else {
+                        this.select_entry(id, cx);
+                    }
+                }))
+                .on_secondary_mouse_down(cx.listener(
+                    move |this, event: &MouseDownEvent, window, cx| {
+                        cx.stop_propagation();
+                        this.select_entry(id, cx);
+                        this.deploy_context_menu(event.position, id, window, cx);
+                    },
+                ))
             })
             .start_slot(
                 Icon::new(icon)
@@ -566,6 +673,15 @@ impl Render for RemoteExplorer {
                     .child(Label::new("No saved sessions").color(Color::Muted))
                     .into_any_element()
             })
+            .children(self.context_menu.as_ref().map(|(menu, position, _)| {
+                deferred(
+                    anchored()
+                        .position(*position)
+                        .anchor(gpui::Corner::TopLeft)
+                        .child(menu.clone()),
+                )
+                .with_priority(1)
+            }))
     }
 }
 
